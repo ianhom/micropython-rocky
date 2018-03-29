@@ -39,7 +39,7 @@
 #include "lib/oofatfs/ff.h"
 #include "extmod/vfs.h"
 #include "extmod/vfs_fat.h"
-
+#include "fsl_debug_console.h"
 #include "systick.h"
 #include "pendsv.h"
 #include "pybthread.h"
@@ -283,6 +283,7 @@ STATIC bool init_sdcard_fs(bool first_soft_reset) {
 
         if (res != FR_OK) {
             // couldn't mount
+			PRINTF("can't mount SD card FS! err=%d\r\n", res);
             m_del_obj(fs_user_mount_t, vfs_fat);
             m_del_obj(mp_vfs_mount_t, vfs);
         } else {
@@ -418,15 +419,10 @@ STATIC uint update_reset_mode(uint reset_mode) {
 
 HAL_StatusTypeDef HAL_Init(void)
 {
-	UnalignTest();
     BOARD_ConfigMPU();
-	UnalignTest();
     BOARD_InitPins();
-	UnalignTest();
     BOARD_BootClockRUN();
-	UnalignTest();
     BOARD_InitDebugConsole();
-	UnalignTest();
 	/* Set Interrupt Group Priority */
 	NVIC_SetPriorityGrouping(3);
 	
@@ -439,14 +435,14 @@ HAL_StatusTypeDef HAL_Init(void)
 
 #if defined(__CC_ARM)
 	#define STACK_SIZE	(0x1800)
-	uint32_t  _ram_start = 0x20200000, _ram_end = 0x20010000, _estack = 0x20000000 + STACK_SIZE, _heap_end = 0x20240000;
+	uint32_t  _ram_start = 0x20000000, _ram_end = 0x20070000, _estack = 0x20000000 + STACK_SIZE, _heap_end = 0x20070000;
 	extern unsigned int Image$$MPY_HEAP_START$$Base;
 	uint32_t _heap_start = (uint32_t) &Image$$MPY_HEAP_START$$Base;
 #elif defined(__ICCARM__)
 	extern unsigned int CHEAP$$Limit[], lg_c1Stack[];
 	uint32_t _heap_start = (uint32_t)CHEAP$$Limit;	// we put HEAP at the last of DATA region, so we can assume mpy heap start here
 	
-	uint32_t  _ram_start = 0x20200000, _ram_end = (uint32_t)CHEAP$$Limit, _estack = 0x04000000 + (uint32_t)lg_c1Stack, _heap_end = 0x20028000;
+	uint32_t  _ram_start = 0x20000000, _ram_end = (uint32_t)CHEAP$$Limit, _estack = 0x20000000 + (uint32_t)lg_c1Stack, _heap_end = 0x20070000;
 #elif defined(__GNUC__)
 extern uint32_t _ram_start, _ram_end, _estack, _heap_end, _heap_start;
 #endif
@@ -460,7 +456,6 @@ int main(void) {
          - Set NVIC Group Priority to 4
          - Global MSP (MCU Support Package) initialization
        */
-	UnalignTest();
     HAL_Init();
 	
 
@@ -486,7 +481,6 @@ int main(void) {
     int first_soft_reset = true;
 
 soft_reset:
-	UnalignTest();
     // check if user switch held to select the reset mode
 #if defined(MICROPY_HW_LED2)
     led_state(1, 0);
@@ -541,7 +535,6 @@ soft_reset:
 #endif
     // Micro Python init
     mp_init();
-	UnalignTest();
     mp_obj_list_init(mp_sys_path, 0);
     mp_obj_list_append(mp_sys_path, MP_OBJ_NEW_QSTR(MP_QSTR_)); // current dir (or base dir of the script)
     mp_obj_list_init(mp_sys_argv, 0);
@@ -595,9 +588,22 @@ soft_reset:
     if (sdcard_is_present()) {
         // if there is a file in the flash called "SKIPSD", then we don't mount the SD card
         if (!mounted_flash || f_stat(&fs_user_mount_flash.fatfs, "/SKIPSD", NULL) != FR_OK) {
-            mounted_sdcard = init_sdcard_fs(first_soft_reset);
+			int retry = 10;
+			while (retry--) {
+				mounted_sdcard = init_sdcard_fs(first_soft_reset);
+				if (mounted_sdcard)
+					break;
+				else
+				{
+					uint32_t t0;
+					t0 = HAL_GetTick();
+					while (HAL_GetTick() - t0 < 100) {}
+				}
+			}
         }
-    }
+    } else {
+		
+	}
 #endif
 
     // set sys.path based on mounted filesystems (/sd is first so it can override /flash)
