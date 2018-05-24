@@ -164,9 +164,18 @@ void _Fault_UnalignedLSTRH(uint8_t* pAddr, uint16_t val16) {
 	*pAddr++ = (uint8_t)(val16 & 0xFF);
 }
 
-
-void HardFault_C_Handler(ExceptionRegisters_t *regs, uint32_t *pXtraRegs) {
-    if (!pyb_hard_fault_debug) {
+void HardFault_C_Handler(ExceptionRegisters_t *regs, uint32_t *pXtraRegs, uint32_t strType) {
+    if ((regs->xpsr & 0xC000) && SCB->CFSR == 0x20000) {
+		// INVSTATE with wrong xPSR (EPSR) values
+		regs->xpsr &= ~0x0000C000;
+		SCB->CFSR = SCB->CFSR;
+		return;
+	}
+	
+	__asm {
+		bkpt	#0
+	}
+	if (!pyb_hard_fault_debug) {
         NVIC_SystemReset();
     }
 
@@ -222,7 +231,16 @@ void HardFault_C_Handler(ExceptionRegisters_t *regs, uint32_t *pXtraRegs) {
     }
 
     /* Go to infinite loop when Hard Fault exception occurs */
-    __fatal_error("HardFault");
+	switch (strType) 
+	{
+	case 1:
+		__fatal_error("MemManage fault");
+		break;
+	default:
+		__fatal_error("HardFault");
+		break;
+	}
+    
 }
 
 // Naked functions have no compiler generated gunk, so are the best thing to
@@ -242,11 +260,11 @@ __asm void HardFault_Handler(void) {
      ite eq                 // Tell the assembler that the nest 2 instructions are if-then-else
      mrseq r0, msp          // Make R0 point to main stack pointer
      mrsne r0, psp          // Make R0 point to process stack pointer
-	 push	{r4-r11}
+	 push	{r4-r11, lr}
 	 mov	r1,	sp
-     b HardFault_C_Handler  // Off to C land
-	 pop	{r4-r11}
-	 bx		lr
+     bl HardFault_C_Handler  // Off to C land
+	 pop	{r4-r11, lr}
+	 bx		lr	// give a chance to see LR's value
 }
 #else
 __attribute__((naked))
@@ -282,13 +300,51 @@ void NMI_Handler(void) {
   * @param  None
   * @retval None
   */
-void MemManage_Handler(void) {
-    /* Go to infinite loop when Memory Manage exception occurs */
-    while (1) {
-        __fatal_error("MemManage");
-    }
-}
+#ifdef __CC_ARM
+__asm void MemManage_Handler(void) {
 
+    // From the ARMv7M Architecture Reference Manual, section B.1.5.6
+    // on entry to the Exception, the LR register contains, amongst other
+    // things, the value of CONTROL.SPSEL. This can be found in bit 3.
+    //
+    // If CONTROL.SPSEL is 0, then the exception was stacked up using the
+    // main stack pointer (aka MSP). If CONTROL.SPSEL is 1, then the exception
+    // was stacked up using the process stack pointer (aka PSP).
+     IMPORT HardFault_C_Handler
+     tst lr, #4             // Test Bit 3 to see which stack pointer we should use.
+     ite eq                 // Tell the assembler that the nest 2 instructions are if-then-else
+     mrseq r0, msp          // Make R0 point to main stack pointer
+     mrsne r0, psp          // Make R0 point to process stack pointer
+	 push	{r4-r11}
+	 mov	r1,	sp
+	 mov	r2,	#1
+     bl HardFault_C_Handler  // Off to C land
+	 pop	{r4-r11}
+	 bx		lr
+}
+#else
+__attribute__((naked))
+void MemManage_Handler(void) {
+
+    // From the ARMv7M Architecture Reference Manual, section B.1.5.6
+    // on entry to the Exception, the LR register contains, amongst other
+    // things, the value of CONTROL.SPSEL. This can be found in bit 3.
+    //
+    // If CONTROL.SPSEL is 0, then the exception was stacked up using the
+    // main stack pointer (aka MSP). If CONTROL.SPSEL is 1, then the exception
+    // was stacked up using the process stack pointer (aka PSP).
+
+    __asm volatile(
+    " tst lr, #4    \n"         // Test Bit 3 to see which stack pointer we should use.
+    " ite eq        \n"         // Tell the assembler that the nest 2 instructions are if-then-else
+    " mrseq r0, msp \n"         // Make R0 point to main stack pointer
+    " mrsne r0, psp \n"         // Make R0 point to process stack pointer
+    " mov r1, sp \n" 
+	" mov r2, #1 \n" 
+	" b HardFault_C_Handler \n" // Off to C land
+    );
+}
+#endif
 /**
   * @brief  This function handles Bus Fault exception.
   * @param  None
@@ -334,9 +390,12 @@ void DebugMon_Handler(void) {
   * @param  None
   * @retval None
   */
+#ifndef __CC_ARM
+// for ARM CC, we use asm IRQ handler
 void PendSV_Handler(void) {
     pendsv_isr_handler();
 }
+#endif
 #include "storage.h"
 /**
   * @brief  This function handles SysTick Handler.
@@ -345,7 +404,13 @@ void PendSV_Handler(void) {
   */
 extern void dma_idle_handler(uint32_t tick);
 extern void SDMMC_Tick_Handler(void);
-void SysTick_Handler(void) {
+
+#if SYSTICK_PRESCALE > 1
+ExceptionRegisters_t s_traces[256];
+uint32_t s_traceNdx;
+uint32_t s_prescale;
+#endif
+void SysTick_C_Handler(ExceptionRegisters_t *regs) {
     // Instead of calling HAL_IncTick we do the increment here of the counter.
     // This is purely for efficiency, since SysTick is called 1000 times per
     // second at the highest interrupt priority.
@@ -353,6 +418,15 @@ void SysTick_Handler(void) {
     // the only place where it can be modified, and the code is more efficient
     // without the volatile specifier.
     extern uint32_t uwTick;
+	#if SYSTICK_PRESCALE > 1
+	s_traces[s_traceNdx++] = *regs;
+	if (s_traceNdx >= 256)
+		s_traceNdx = 0;
+	if (++s_prescale < SYSTICK_PRESCALE)
+		return;
+	s_prescale = 0;
+	#endif
+	
     uwTick += 1;
 	SDMMC_Tick_Handler();
     // Read the systick control regster. This has the side effect of clearing
@@ -386,7 +460,21 @@ void SysTick_Handler(void) {
         }
     }
     #endif
+	__DSB();
 }
+
+__asm void SysTick_Handler(void) {
+	IMPORT	SysTick_C_Handler
+	PRESERVE8
+	mrseq r0, msp		   // Make R0 point to main stack pointer
+	mrsne r0, psp		   // Make R0 point to process stack pointer
+	push   {lr}
+	bl SysTick_C_Handler  // Off to C land
+	pop    {lr}
+	bx	   lr
+
+}
+
 
 // Handle a flash (erase/program) interrupt.
 void Reserved168_IRQHandler(void) {
@@ -401,6 +489,7 @@ void Reserved168_IRQHandler(void) {
     // This call the storage IRQ handler, to check if the flash cache needs flushing
     storage_irq_handler();
     IRQ_EXIT(Reserved168_IRQn);
+	__DSB();
 }
 
 

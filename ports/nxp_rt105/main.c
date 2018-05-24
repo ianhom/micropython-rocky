@@ -63,6 +63,7 @@
 // #include "dac.h"
 // #include "can.h"
 #include "modnetwork.h"
+#include "virtual_com.h"
 void UnalignTest(void);
 void SystemClock_Config(void);
 
@@ -82,6 +83,7 @@ void flash_error(int n) {
 }
 
 void NORETURN __fatal_error(const char *msg) {
+	// make sure this function can never return, i.e., use infinite loop or do system call
     for (volatile uint delay = 0; delay < 10000000; delay++) {
     }
     led_state(1, 1);
@@ -90,7 +92,8 @@ void NORETURN __fatal_error(const char *msg) {
     led_state(4, 1);
     mp_hal_stdout_tx_strn("\nFATAL ERROR:\n", 14);
     mp_hal_stdout_tx_strn(msg, strlen(msg));
-    for (uint i = 0;i<1000;i++) {
+    for (uint i = 0;i<1000;i++) 
+	{
         // led_toggle(((i++) & 3) + 1);
 		led_toggle(0);
         for (volatile uint delay = 0; delay < 10000000; delay++) {
@@ -100,6 +103,7 @@ void NORETURN __fatal_error(const char *msg) {
             __WFI();
         }
     }
+	while(1) {}
 }
 
 void nlr_jump_fail(void *val) {
@@ -144,9 +148,95 @@ static const char fresh_boot_py[] __ALIGNED(4) =
 "#pyb.usb_mode('VCP+HID') # act as a serial device and a mouse\r\n"
 ;
 
+static const char fresh_selftest_py[] =
+"import sensor, time, pyb\n"
+"\n"
+"def test_int_adc():\n"
+"    adc  = pyb.ADCAll(12)\n"
+"    # Test VBAT\n"
+"    vbat = adc.read_core_vbat()\n"
+"    vbat_diff = abs(vbat-3.3)\n"
+"    if (vbat_diff > 0.1):\n"
+"        raise Exception('INTERNAL ADC TEST FAILED VBAT=%fv'%vbat)\n"
+"\n"
+"    # Test VREF\n"
+"    vref = adc.read_core_vref()\n"
+"    vref_diff = abs(vref-1.2)\n"
+"    if (vref_diff > 0.1):\n"
+"        raise Exception('INTERNAL ADC TEST FAILED VREF=%fv'%vref)\n"
+"    adc = None\n"
+"    print('INTERNAL ADC TEST PASSED...')\n"
+"\n"
+"def test_color_bars():\n"
+"    sensor.reset()\n"
+"    # Set sensor settings\n"
+"    sensor.set_brightness(0)\n"
+"    sensor.set_saturation(3)\n"
+"    sensor.set_gainceiling(8)\n"
+"    sensor.set_contrast(2)\n"
+"\n"
+"    # Set sensor pixel format\n"
+"    sensor.set_framesize(sensor.QVGA)\n"
+"    sensor.set_pixformat(sensor.RGB565)\n"
+"\n"
+"    # Enable colorbar test mode\n"
+"    sensor.set_colorbar(True)\n"
+"\n"
+"    # Skip a few frames to allow the sensor settle down\n"
+"    for i in range(0, 100):\n"
+"        image = sensor.snapshot()\n"
+"\n"
+"    #color bars thresholds\n"
+"    t = [lambda r, g, b: r < 70  and g < 70  and b < 70,   # Black\n"
+"         lambda r, g, b: r < 70  and g < 70  and b > 200,  # Blue\n"
+"         lambda r, g, b: r > 200 and g < 70  and b < 70,   # Red\n"
+"         lambda r, g, b: r > 200 and g < 70  and b > 200,  # Purple\n"
+"         lambda r, g, b: r < 70  and g > 200 and b < 70,   # Green\n"
+"         lambda r, g, b: r < 70  and g > 200 and b > 200,  # Aqua\n"
+"         lambda r, g, b: r > 200 and g > 200 and b < 70,   # Yellow\n"
+"         lambda r, g, b: r > 200 and g > 200 and b > 200]  # White\n"
+"\n"
+"    # color bars are inverted for OV7725\n"
+"    if (sensor.get_id() == sensor.OV7725):\n"
+"        t = t[::-1]\n"
+"\n"
+"    #320x240 image with 8 color bars each one is approx 40 pixels.\n"
+"    #we start from the center of the frame buffer, and average the\n"
+"    #values of 10 sample pixels from the center of each color bar.\n"
+"    for i in range(0, 8):\n"
+"        avg = (0, 0, 0)\n"
+"        idx = 40*i+20 #center of colorbars\n"
+"        for off in range(0, 10): #avg 10 pixels\n"
+"            rgb = image.get_pixel(idx+off, 120)\n"
+"            avg = tuple(map(sum, zip(avg, rgb)))\n"
+"\n"
+"        if not t[i](avg[0]/10, avg[1]/10, avg[2]/10):\n"
+"            raise Exception('COLOR BARS TEST FAILED.'\n"
+"            'BAR#(%d): RGB(%d,%d,%d)'%(i+1, avg[0]/10, avg[1]/10, avg[2]/10))\n"
+"\n"
+"    print('COLOR BARS TEST PASSED...')\n"
+"\n"
+"if __name__ == '__main__':\n"
+"    print('')\n"
+"    test_int_adc()\n"
+"    test_color_bars()\n"
+"\n"
+;
 
 static const char fresh_main_py[] __ALIGNED(4) =
-"# main.py -- put your code here!\r\n"
+"# main.py -- put your code here!\n"
+"import pyb, time\n"
+"led = pyb.LED(1)\n"
+"usb = pyb.USB_VCP()\n"
+"while (usb.isconnected()==False):\n"
+"   led.on()\n"
+"   time.sleep(150)\n"
+"   led.off()\n"
+"   time.sleep(100)\n"
+"   led.on()\n"
+"   time.sleep(150)\n"
+"   led.off()\n"
+"   time.sleep(600)\n"
 ;
 
 static const char fresh_pybcdc_inf[] __ALIGNED(4) =
@@ -166,6 +256,19 @@ static const char fresh_readme_txt[] __ALIGNED(4) =
 " - Linux: use the command: screen /dev/ttyACM0\r\n"
 "\r\n"
 "Please visit http://micropython.org/help/ for further help.\r\n"
+"Thank you for supporting the OpenMV project!\r\n"
+"\r\n"
+"To download the IDE, please visit:\r\n"
+"https://openmv.io/pages/download\r\n"
+"\r\n"
+"For tutorials and documentation, please visit:\r\n"
+"http://docs.openmv.io/\r\n"
+"\r\n"
+"For technical support and projects, please visit the forums:\r\n"
+"http://forums.openmv.io/\r\n"
+"\r\n"
+"Please use github to report bugs and issues:\r\n"
+"https://github.com/openmv/openmv\r\n"
 ;
 
 // avoid inlining to avoid stack usage within main()
@@ -214,6 +317,11 @@ MP_NOINLINE STATIC bool init_flash_fs(uint reset_mode) {
         f_open(&vfs_fat->fatfs, &fp, "/README.txt", FA_WRITE | FA_CREATE_ALWAYS);
         f_write(&fp, fresh_readme_txt, sizeof(fresh_readme_txt) - 1 /* don't count null terminator */, &n);
         f_close(&fp);
+
+	    // Create default selftest.py
+	    f_open(&vfs_fat->fatfs, &fp, "/selftest.py", FA_WRITE | FA_CREATE_ALWAYS);
+	    f_write(&fp, fresh_selftest_py, sizeof(fresh_selftest_py) - 1 /* don't count null terminator */, &n);
+	    f_close(&fp);
 
         // keep LED on for at least 200ms
         sys_tick_wait_at_least(start_tick, 200);
@@ -285,7 +393,7 @@ STATIC bool init_sdcard_fs(bool first_soft_reset) {
 
         if (res != FR_OK) {
             // couldn't mount
-			PRINTF("can't mount SD card FS! err=%d\r\n", res);
+			
             m_del_obj(fs_user_mount_t, vfs_fat);
             m_del_obj(mp_vfs_mount_t, vfs);
         } else {
@@ -431,25 +539,85 @@ HAL_StatusTypeDef HAL_Init(void)
 	/* Use systick as time base source and configure 1ms tick (default clock after Reset is HSI) */
 	HAL_InitTick(1);
 
+	#if XIP_EXTERNAL_FLASH
+	uint32_t wait;
+	for (wait = HAL_GetTick(); wait < 3001; wait = HAL_GetTick()) {
+		if (wait % 250 == 0) {
+			PRINTF("%d\r\n", (3001 - wait) / 250);
+		}
+		__WFI();
+	}
+	#endif
 	
 	return HAL_OK;
 }
 
+#ifdef MEM_PROFILING
+#define DTCM_END	0x20078000
+#else
+#define DTCM_END	0x20078000
+#endif
+
 #if defined(__CC_ARM)
-	#define STACK_SIZE	(0x1800)
-	uint32_t  _ram_start = 0x20000000, _ram_end = 0x20070000, _estack = 0x20000000 + STACK_SIZE, _heap_end = 0x20070000;
+	#define STACK_SIZE	(0x2000)
+	uint32_t  _ram_start = 0x20000000, _ram_end = DTCM_END, _estack = 0x20000000 + STACK_SIZE, _heap_end = DTCM_END;
 	extern unsigned int Image$$MPY_HEAP_START$$Base;
 	uint32_t _heap_start = (uint32_t) &Image$$MPY_HEAP_START$$Base;
 #elif defined(__ICCARM__)
 	extern unsigned int CHEAP$$Limit[], lg_c1Stack[];
 	uint32_t _heap_start = (uint32_t)CHEAP$$Limit;	// we put HEAP at the last of DATA region, so we can assume mpy heap start here
 	
-	uint32_t  _ram_start = 0x20000000, _ram_end = (uint32_t)CHEAP$$Limit, _estack = 0x20000000 + (uint32_t)lg_c1Stack, _heap_end = 0x20070000;
+	uint32_t  _ram_start = 0x20000000, _ram_end = (uint32_t)CHEAP$$Limit, _estack = 0x20000000 + (uint32_t)lg_c1Stack, _heap_end = DTCM_END;
 #elif defined(__GNUC__)
 extern uint32_t _ram_start, _ram_end, _estack, _heap_end, _heap_start;
 #endif
 
+void PYB_MainLoop(uint32_t reset_mode) {
+    // Run the main script from the current directory.
+    if ((reset_mode == 1 || reset_mode == 3) && pyexec_mode_kind == PYEXEC_MODE_FRIENDLY_REPL) {
+        const char *main_py;
+        if (MP_STATE_PORT(pyb_config_main) == MP_OBJ_NULL) {
+            main_py = "main.py";
+        } else {
+            main_py = mp_obj_str_get_str(MP_STATE_PORT(pyb_config_main));
+        }
+        mp_import_stat_t stat = mp_import_stat(main_py);
+        if (stat == MP_IMPORT_STAT_FILE) {
+            int ret = pyexec_file(main_py);
+            if (ret & PYEXEC_FORCED_EXIT) {
+                // goto soft_reset_exit;
+				return;
+            }
+            if (!ret) {
+                flash_error(3);
+            }
+        }
+    }
+
+    // Main script is finished, so now go into REPL mode.
+    // The REPL mode can change, or it can request a soft reset.
+    for (;;) {
+        if (pyexec_mode_kind == PYEXEC_MODE_RAW_REPL) {
+            if (pyexec_raw_repl() != 0) {
+                break;
+            }
+        } else {
+			VCOM_Open();
+            if (pyexec_friendly_repl() != 0) {
+                break;
+            }
+        }
+    }
+}
+
+__WEAK void sensor_init0() {}
+__WEAK void sensor_init() {}
+#include "usbdbg.h"
+
+extern int OpenMV_Main(uint32_t first_soft_reset);
+
 int main(void) {
+	int retCode = 0;
     // TODO disable JTAG
 
     /* STM32F4xx HAL library initialization:
@@ -459,7 +627,6 @@ int main(void) {
          - Global MSP (MCU Support Package) initialization
        */
     HAL_Init();
-	
 
     #if defined(MICROPY_BOARD_EARLY_INIT)
     MICROPY_BOARD_EARLY_INIT();
@@ -480,8 +647,8 @@ int main(void) {
     pyb_usb_storage_medium = PYB_USB_STORAGE_MEDIUM_FLASH;
 #endif
 
-    int first_soft_reset = true;
-
+    bool first_soft_reset = true;
+	retCode = true;
 soft_reset:
     // check if user switch held to select the reset mode
 #if defined(MICROPY_HW_LED2)
@@ -496,7 +663,6 @@ soft_reset:
     uint reset_mode = update_reset_mode(1);
 
     machine_init();
-
 #if MICROPY_HW_ENABLE_RTC
     if (first_soft_reset) {
         rtc_init_start(false);
@@ -524,7 +690,7 @@ soft_reset:
     // Note: stack control relies on main thread being initialised above
     mp_stack_set_top((void*) _estack);
     mp_stack_set_limit(STACK_SIZE);
-	
+	MP_STATE_PORT(omv_ide_irq) = 0;
     gc_init((void*) _heap_start, (void*) _heap_end);
 #elif defined(__GNUC__)
     // Stack limit should be less than real stack size, so we have a chance
@@ -546,6 +712,7 @@ soft_reset:
     // we can run Python scripts (eg boot.py), but anything that is configurable
     // by boot.py must be set after boot.py is run.
 
+    // sensor_init0();
     readline_init0();
     pin_init0();
     // rocky ignore: extint_init0();
@@ -575,14 +742,20 @@ soft_reset:
 #if MICROPY_HW_ENABLE_RNG
     rng_init0();
 #endif
-
+	usbdbg_init();	// must be after mpy's heap init, as it uses mpy's heap
 	// rocky ignore: i2c_init0();
 	// rocky ignore: spi_init0();
+
 	pyb_usb_init0();
 
     // Initialise the local flash filesystem.
     // Create it if needed, mount in on /flash, and set it as current dir.
-    bool mounted_flash = init_flash_fs(reset_mode);
+	bool mounted_flash;
+	#ifndef XIP_EXTERNAL_FLASH
+    mounted_flash = init_flash_fs(reset_mode);
+	#else
+	mounted_flash = 0;
+	#endif
 
     bool mounted_sdcard = false;
 #if MICROPY_HW_HAS_SDCARD
@@ -590,7 +763,7 @@ soft_reset:
     if (sdcard_is_present()) {
         // if there is a file in the flash called "SKIPSD", then we don't mount the SD card
         if (!mounted_flash || f_stat(&fs_user_mount_flash.fatfs, "/SKIPSD", NULL) != FR_OK) {
-			int retry = 10;
+			int retry = 16;
 			while (retry--) {
 				mounted_sdcard = init_sdcard_fs(first_soft_reset);
 				if (mounted_sdcard)
@@ -598,13 +771,14 @@ soft_reset:
 				else
 				{
 					uint32_t t0;
+					PRINTF("can't mount SD card FS!\r\n");
 					t0 = HAL_GetTick();
-					while (HAL_GetTick() - t0 < 100) {}
+					while (HAL_GetTick() - t0 < 250) {}
 				}
 			}
         }
     } else {
-		
+		 
 	}
 #endif
 
@@ -654,8 +828,11 @@ soft_reset:
 
 #if defined(USE_DEVICE_MODE)
     // init USB device to default setting if it was not already configured
-    if (!(pyb_usb_flags & PYB_USB_FLAG_USB_MODE_CALLED)) {
-        pyb_usb_dev_init(USBD_VID, USBD_PID_CDC_MSC, USBD_MODE_CDC_MSC, NULL);
+    if (first_soft_reset) {
+	    if (!(pyb_usb_flags & PYB_USB_FLAG_USB_MODE_CALLED)) {
+	        pyb_usb_dev_init(USBD_VID, USBD_PID_CDC_MSC, USBD_MODE_CDC_MSC, NULL);
+			// NVIC_SetPriority(USB_OTG1_IRQn, 0);
+	    }
     }
 #endif
 
@@ -678,42 +855,11 @@ soft_reset:
     mod_network_init();
 #endif
 
+
     // At this point everything is fully configured and initialised.
 
-    // Run the main script from the current directory.
-    if ((reset_mode == 1 || reset_mode == 3) && pyexec_mode_kind == PYEXEC_MODE_FRIENDLY_REPL) {
-        const char *main_py;
-        if (MP_STATE_PORT(pyb_config_main) == MP_OBJ_NULL) {
-            main_py = "main.py";
-        } else {
-            main_py = mp_obj_str_get_str(MP_STATE_PORT(pyb_config_main));
-        }
-        mp_import_stat_t stat = mp_import_stat(main_py);
-        if (stat == MP_IMPORT_STAT_FILE) {
-            int ret = pyexec_file(main_py);
-            if (ret & PYEXEC_FORCED_EXIT) {
-                goto soft_reset_exit;
-            }
-            if (!ret) {
-                flash_error(3);
-            }
-        }
-    }
-
-    // Main script is finished, so now go into REPL mode.
-    // The REPL mode can change, or it can request a soft reset.
-    for (;;) {
-        if (pyexec_mode_kind == PYEXEC_MODE_RAW_REPL) {
-            if (pyexec_raw_repl() != 0) {
-                break;
-            }
-        } else {
-            if (pyexec_friendly_repl() != 0) {
-                break;
-            }
-        }
-    }
-
+ 	VCOM_Open();
+	retCode = OpenMV_Main(retCode);
 soft_reset_exit:
 
     // soft reset
@@ -741,7 +887,7 @@ void _exit(int x) {
 	printf("main() exit!\r\n");
 	while (1) {}
 }
-
+#if 0
 // own impl of alloca, has risk that later alloca overlap with earlier alloca
 // larger ALLOCA_BUF_SIZE reduces the risk, make sure you make sufficient test!
 #define ALLOCA_BUF_SIZE	2048
@@ -756,3 +902,4 @@ void* rollback_alloca(uint32_t cb)
 	s_allocaNdx += (cb + 3) >> 2;
 	return pRet;
 }
+#endif

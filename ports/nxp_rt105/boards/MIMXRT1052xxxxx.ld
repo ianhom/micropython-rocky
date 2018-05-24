@@ -64,10 +64,11 @@ MEMORY
   m_text                (RX)  : ORIGIN = 0x80000400, LENGTH = 0x01000000
   m_data                (RW)  : ORIGIN = 0x81000400, LENGTH = 0x00DFFC00
   m_ncache              (RW)  : ORIGIN = 0x81E00000, LENGTH = 0x00200000
-  m_data2               (RW)  : ORIGIN = 0x20000000, LENGTH = 0x00020000
-  m_data3               (RW)  : ORIGIN = 0x20200000, LENGTH = 0x00040000
+  m_dtcm                (RW)  : ORIGIN = 0x20000000, LENGTH = 0x00020000
+  m_ocram               (RW)  : ORIGIN = 0x20200000, LENGTH = 0x00040000
 }
-
+/* could be buggy to place _fb_base like below */
+//_fb_base = ORIGIN(m_dtcm);
 /* Define output sections */
 SECTIONS
 {
@@ -210,6 +211,9 @@ SECTIONS
   text_end = ORIGIN(m_text) + LENGTH(m_text);
   ASSERT(__DATA_END <= text_end, "region m_text overflowed with text and data")
 
+  FB_SIZE  = 301*1024;
+  JPEG_SIZE  = 48*1024;
+
   /* Uninitialized data section */
   .bss :
   {
@@ -222,9 +226,16 @@ SECTIONS
     *(.bss*)
     *(COMMON)
     . = ALIGN(4);
+    _ld_main_fb = .;
+	. += FB_SIZE;
+	_ld_jpeg_buf = .;
+	. = ALIGN(4);
+	. += JPEG_SIZE;
     __bss_end__ = .;
     __END_BSS = .;
   } > m_data
+  PROVIDE(_jpeg_buf = _ld_jpeg_buf);
+  PROVIDE(_fb_base = _ld_main_fb);
   PROVIDE(_sbss = __START_BSS);
   PROVIDE(_ebss = __END_BSS);
   .heap :

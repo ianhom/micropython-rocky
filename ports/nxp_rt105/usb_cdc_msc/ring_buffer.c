@@ -199,6 +199,9 @@ int32_t RingBlk_Init(ring_block_t *pRB, uint8_t *pBlksAry, uint32_t blkSize, uin
 
 {
 	uint32_t i;
+	if (blkCnt > RING_BLOCK_MAX_CNT) {
+		return -1L;
+	}
 	pRB->pBlks	 	= (uint8_t*)pBlksAry;
 	pRB->blkSize	= blkSize;
 	pRB->blkCnt 	= blkCnt;
@@ -238,19 +241,22 @@ int32_t RingBlk_GetFreeBytes(ring_block_t* pRB) {
 	return pRB->blkCnt * pRB->blkSize - pRB->cbTotUsed;
 }
 
-
+// #define RB_DEBUG
 int32_t RingBlk_ReadLimitedBlks(ring_block_t* pRB, uint8_t* pBuf, uint32_t dataBytes, uint32_t maxBlks, uint8_t isUpdt)
 {
 	uint32_t cb, dataBytes0;
 	uint32_t blkNdx, usedCnt, byteNdx, cbBlkFill0;
 	INIT_CRITICAL_RBK();
-	ENTER_CRITICAL_RBK();
-	
+	ENTER_CRITICAL_RBK();	
+#ifdef RB_DEBUG
+	ring_block_t rbBkup = *pRB;
+beginwork:	
+#endif
 	blkNdx = pRB->rNdx , byteNdx = pRB->blkRNdx;
 	cbBlkFill0 = pRB->cbBlkFillTos[blkNdx];
 	// if dataBytes is 0, then we read exactly one block
 	if (dataBytes == 0)
-		dataBytes = pRB->blkSize - cbBlkFill0;
+		dataBytes = cbBlkFill0 - pRB->blkRNdx; // pRB->blkSize - cbBlkFill0;
 	dataBytes0 = dataBytes;
 	if (0 == (usedCnt = pRB->usedCnt))
 		goto Cleanup;	
@@ -258,6 +264,8 @@ int32_t RingBlk_ReadLimitedBlks(ring_block_t* pRB, uint8_t* pBuf, uint32_t dataB
 	while (dataBytes && usedCnt) {
 		
 		cb = cbBlkFill0 - byteNdx;
+		if (0 == cb)
+			break;	// no more to read
 		if (cb > dataBytes)
 			cb = dataBytes;
 		if (pBuf) {	// if pBuf is NULL, we simply free blocks
@@ -272,22 +280,60 @@ int32_t RingBlk_ReadLimitedBlks(ring_block_t* pRB, uint8_t* pBuf, uint32_t dataB
 		if (isUpdt) {
 			pRB->cbTotUsed -= cb;
 			// pRB->cbBlkFillTos[blkNdx] -= cb;	// fillTos is the watermark of even max filled
-		}		
+		}
 		if (byteNdx == cbBlkFill0) {
-			// a block is totally read, switch to next block
+			// one block is totally read, go ahead to next block, even if the block is not fully filled
 			byteNdx = 0 , usedCnt--;
-			if (isUpdt)
+			if (isUpdt) {
 				pRB->cbBlkFillTos[blkNdx] = 0;
+				if (pRB->wNdx == blkNdx && pRB->blkWNdx != 0) {	
+					// current block is not yet fully filled, still go to next block to ensure alignment
+					// bugfix note: judgement of pRB->blkWNdx != 0 is critical, otherwise in a corner case
+					// when the RB is full that wNdx==rNdx, code will wrongly adjust wNdx
+					/*
+					if (++pRB->wNdx == pRB->blkCnt)
+						pRB->wNdx = 0;
+					
+					pRB->blkWNdx = 0;
+					*/
+					pRB->blkRNdx = pRB->blkWNdx = 0;
+					if (pRB->cbTotUsed) {
+					#ifdef RB_DEBUG
+					
+						*pRB = rbBkup;
+						goto beginwork;
+					
+					#endif
+						while(1) {}
+					}
+					break;	// in this case, RB must be empty!
+				}
+			}
 			if (++blkNdx >= pRB->blkCnt)
 				blkNdx = 0;
-			cbBlkFill0 = pRB->cbBlkFillTos[blkNdx];	// reload block fill bytes of next block
-			if (--maxBlks)
-				break;	// if we've read max allowed blocks then break. if maxBlks = 0 then treat as no limit			
+			if (dataBytes) {				
+				cbBlkFill0 = pRB->cbBlkFillTos[blkNdx];	// reload block fill bytes of next block
+				if (0 == --maxBlks)
+					break;	// if we've read max allowed blocks then break. if maxBlks = 0 then treat as no limit		
+			}
+
 		}
 	}
 	if (isUpdt)
 		pRB->rNdx = blkNdx , pRB->usedCnt = usedCnt , pRB->blkRNdx = byteNdx;
 Cleanup:
+#ifdef RB_DEBUG	
+	uint32_t i, a = 0;
+	for (i=0; i<pRB->blkCnt; i++) {
+		a += pRB->cbBlkFillTos[i];
+		if (i == pRB->rNdx)
+			a -= pRB->blkRNdx;
+	}
+	if (a != pRB->cbTotUsed) {
+		*pRB = rbBkup;
+		goto beginwork;
+	}
+#endif
 	LEAVE_CRITICAL_RBK();
 	return dataBytes0 - dataBytes;	// returns read bytes
 }
@@ -326,49 +372,92 @@ int32_t RingBlk_Free(ring_block_t* pRB, uint32_t bytesToFree)
 int32_t RingBlk_WriteLimitedBlks(ring_block_t* pRB, const uint8_t* pBuf, uint32_t dataBytes, uint32_t maxBlks)
 {
 	uint32_t cb, cbFree;
-	uint32_t blkNdx, byteNdx, cbBlkFill0, dataBytes0;
+	uint32_t blkNdx, byteNdx, cbBlkFill0, dataBytes0, cbRem = dataBytes;
 	INIT_CRITICAL_RBK();
 	ENTER_CRITICAL_RBK();
+#ifdef RB_DEBUG
+	ring_block_t rbBkup = *pRB;
+beginwork:	
+#endif	
+	cbRem = dataBytes;
 	blkNdx = pRB->wNdx , byteNdx = pRB->blkWNdx;
 	// if dataBytes is 0 then we write exactly 1 block to full
 	if (dataBytes == 0)
-		dataBytes = pRB->blkSize - byteNdx;
-	dataBytes0 = dataBytes;
-	
-	if (0 == (cbFree = RingBlk_GetFreeBytes(pRB)))
+		cbRem = pRB->blkSize - byteNdx;
+	dataBytes0 = cbRem;
+	cbFree = RingBlk_GetFreeBytes(pRB);
+	if (pRB->rNdx == pRB->wNdx && pRB->blkWNdx >= pRB->blkRNdx && pRB->blkRNdx != 0) {
+		cbFree -= pRB->blkRNdx;	// the freed part within a block that is before blkWNdx can't be used
+	}
+	if (0 == cbFree)
 		goto Cleanup;	// block ring is full
+	if (pRB->rNdx == pRB->wNdx && pRB->cbBlkFillTos[pRB->rNdx] != 0 && pRB->blkWNdx == 0) {
+		// this is a corner case when RB is from full to just one read. though there are free spaces
+		// still can't write into
+		goto Cleanup;
+	}
 	
 	cbBlkFill0 = pRB->cbBlkFillTos[blkNdx];
-
+	// if (cbBlkFill0 == 0 && pRB->usedCnt == pRB->blkCnt - 1)
+	//	goto Cleanup;	// leave one free block
 	/* Calculate the maximum amount we can copy */
-	while (dataBytes && cbFree) {
+	while (cbRem && cbFree) {
 		cb = pRB->blkSize - cbBlkFill0;
-		if (dataBytes < cb)
-			cb = dataBytes;
+		if (cbRem < cb)
+			cb = cbRem;
 		if (cb == 1) {
 			pRB->pBlks[pRB->blkSize * blkNdx + byteNdx] = *pBuf;
 		}else{
 			memcpy(pRB->pBlks + pRB->blkSize * blkNdx + byteNdx, pBuf, cb);
 		}
-		dataBytes -= cb , byteNdx += cb, cbFree -= cb;
+		cbRem -= cb , byteNdx += cb, cbFree -= cb;
 		if (cbBlkFill0 == 0)
 			pRB->usedCnt++;
 		pRB->cbTotUsed += cb;
 		pRB->cbBlkFillTos[blkNdx] += cb;
+#ifdef RB_DEBUG			
+		if (pRB->cbBlkFillTos[blkNdx] > pRB->blkSize) {
+			*pRB = rbBkup;
+			goto beginwork;
+		}
+#endif
 		if (byteNdx == pRB->blkSize) {
 			// a block is totally written, switch to next block
 			byteNdx = 0;
 			if (++blkNdx >= pRB->blkCnt)
 				blkNdx = 0;
+			if (blkNdx == pRB->rNdx && pRB->cbBlkFillTos[pRB->rNdx] != 0) {
+				break;	// do not allow to write to partially read block
+			}			
 			cbBlkFill0 = 0;
+			// if (pRB->usedCnt == pRB->blkCnt - 1)
+			//	break;	// leave one free block
 			if (--maxBlks == 0)
 				break;	// if we've read max allowed blocks then break. if maxBlks = 0 then treat as no limit			
 		}
 	}
 	pRB->wNdx = blkNdx , pRB->blkWNdx = byteNdx;
 Cleanup:
+#ifdef RB_DEBUG	
+	uint32_t i, a = 0;
+	for (i=0; i<pRB->blkCnt; i++){
+		a += pRB->cbBlkFillTos[i];
+		if (i == pRB->rNdx)
+			a -= pRB->blkRNdx;		
+	}
+	if (a != pRB->cbTotUsed) {
+		*pRB = rbBkup;
+		goto beginwork;
+	}
+
+	if (pRB->usedCnt > pRB->blkCnt)
+	{
+		*pRB = rbBkup;
+		goto beginwork;
+	}
+#endif	
 	LEAVE_CRITICAL_RBK();
-	return dataBytes0 - dataBytes;	// returns written bytes
+	return dataBytes0 - cbRem;	// returns written bytes
 
 }
 

@@ -58,9 +58,11 @@
 * Variables
 ******************************************************************************/
 extern usb_device_endpoint_struct_t g_cdcVcomDicEndpoints[];
+uint8_t g_isVcpOpen;
+volatile uint8_t g_isUsbHostOpen;
 
 /* Line codinig of cdc device */
-static uint8_t s_lineCoding[LINE_CODING_SIZE] = {
+uint8_t s_lineCoding[LINE_CODING_SIZE] = {
     /* E.g. 0x00,0xC2,0x01,0x00 : 0x0001C200 is 115200 bits per second */
     (LINE_CODING_DTERATE >> 0U) & 0x000000FFU,
     (LINE_CODING_DTERATE >> 8U) & 0x000000FFU,
@@ -81,18 +83,41 @@ static uint8_t s_countryCode[COMM_FEATURE_DATA_SIZE] = {(COUNTRY_SETTING >> 0U) 
 /* CDC ACM information */
 USB_DATA_ALIGNMENT static usb_cdc_acm_info_t s_usbCdcAcmInfo = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0, 0, 0, 0};
 /* Data buffer for receiving and sending*/
-#if DATA_BUFF_SIZE % 64 != 0
-#error "buffer size must be multiples of 64!"
+
+#if VCP_RINGBLK_SIZE % 32 != 0
+#error "buffer size must be multiples of 32!"
 #endif
-#define VCP_OUTEPBUF_CNT 3
-#define VCP_INEPBUF_CNT 3
-USB_DATA_ALIGNMENT static uint8_t s_RecvBuf[VCP_INEPBUF_CNT][DATA_BUFF_SIZE];
-USB_DATA_ALIGNMENT static uint8_t s_SendBuf[VCP_OUTEPBUF_CNT][DATA_BUFF_SIZE];
+
+#if USB_DATA_ALIGN_SIZE < 32
+#error "wrong USB align size"
+#endif
+
+#define USB_ALIGN	USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE)
+
+USB_ALIGN static uint8_t s_RecvBuf[VCP_INEPBUF_CNT][VCP_RINGBLK_SIZE];
+USB_ALIGN static uint8_t s_SendBuf[VCP_OUTEPBUF_CNT][VCP_RINGBLK_SIZE];
 
 ring_block_t s_txRB, s_rxRB;
 uint8_t *s_pCurTxBuf, *s_pCurRxBuf;
 uint8_t s_isTxIdle;
 volatile static usb_device_composite_struct_t *g_deviceComposite;
+
+// >>> openMV IDE related 
+#include "usbdbg.h"
+/*static*/ __IO uint8_t dev_is_connected = 0; // indicates if we are connected
+/*static*/ __IO uint8_t debug_mode = 0; 
+/*static*/ __IO uint32_t baudrate = 0;
+/*static*/ uint32_t dbg_xfer_length=0;
+
+#define ALIGN32 __ALIGNED(32)
+
+ring_block_t s_omvRB;
+USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_omvTxBuf[8][VCP_RINGBLK_SIZE];
+
+#define IDE_BAUDRATE_SLOW    (921600)
+#define IDE_BAUDRATE_FAST    (12000000)
+// <<<
+
 
 /*******************************************************************************
 * Code
@@ -110,12 +135,58 @@ usb_status_t _Start_USB_VCOM_Write(class_handle_t handle)
 		s_isTxIdle = 0;
 		error = USB_DeviceCdcAcmSend(handle, g_cfgFix.roCdcDicEpInNdx, s_pCurTxBuf, len);
 		if (error != kStatus_USB_Success) {
-			usb_echo("Failed to send in RingBlk_GetOldestBlk()\r\n");
+			usb_echo("Failed to send in _Start_USB_VCOM_Write()\r\n");
 			s_isTxIdle = txIdleBkup;
 		} else
 			RingBlk_FreeOldestBlk(&s_txRB, 0);	// no longer allow to continue to append data on this block
 	}
 	return error;
+}
+
+static uint32_t last_packet = 0;
+
+#define DBG_MAX_PACKET  (VCP_RINGBLK_SIZE)
+static uint8_t dbg_xfer_buffer[DBG_MAX_PACKET] ;
+
+
+__WEAK void usbdbg_data_in(void *buffer, int length){}
+__WEAK void usbdbg_data_out(void * buffer, int length){}
+__WEAK void usbdbg_control(void *buffer, uint8_t request, uint32_t length){}
+
+
+
+static void send_packet(void) {
+    int bytes = MIN(dbg_xfer_length, 64/*CDC_DATA_FS_MAX_PACKET_SIZE*/);
+    last_packet = bytes;
+    usbdbg_data_in(dbg_xfer_buffer, bytes);
+    dbg_xfer_length -= bytes;
+	VCOM_Write(dbg_xfer_buffer, bytes);
+}
+
+
+uint32_t usbd_cdc_tx_buf_len(void) {
+	return 0;
+	// return RingBlk_GetFreeBytes(&s_txRB);
+}
+uint8_t *usbd_cdc_tx_buf(uint32_t bytes)
+{
+	return (uint8_t*) &s_rxRB;
+}
+
+
+void CheckOpenMVIDEConnect(void) {
+	baudrate = *((uint32_t*)s_lineCoding);
+	// The slow baudrate can be used on OSs that don't support custom baudrates
+	if (baudrate == IDE_BAUDRATE_SLOW || baudrate == IDE_BAUDRATE_FAST) {
+		debug_mode = 1;
+		RingBlk_Init(&s_omvRB, s_omvTxBuf[0], VCP_RINGBLK_SIZE, sizeof(s_omvTxBuf) / VCP_RINGBLK_SIZE);
+		g_isUsbHostOpen = 1;
+		dbg_xfer_length = 0;
+		// UserTxBufPtrIn = UserTxBufPtrOut = UserTxBufPtrOutShadow = 0;
+	} else {
+		debug_mode = 0;
+		// UserTxBufPtrIn = UserTxBufPtrOut = UserTxBufPtrOutShadow = 0;
+	}	
 }
 
 /*!
@@ -129,6 +200,12 @@ usb_status_t _Start_USB_VCOM_Write(class_handle_t handle)
  *
  * @return A USB error code or kStatus_USB_Success.
  */
+ /*static*/ uint8_t s_omvSendIsToContinue;
+// #define HSRX
+#ifdef HSRX
+
+USB_ALIGN static uint8_t s_hsRx[VCP_RINGBLK_SIZE];
+#endif
 usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, void *param)
 {
     usb_status_t error = kStatus_USB_Error;
@@ -169,6 +246,15 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
                 	s_isTxIdle = 1;	// all TX data is sent in this round
 				}
             }
+			// >>> openMV data resume
+			if (s_omvSendIsToContinue) {
+				if (dbg_xfer_length) {
+					send_packet(); //prime tx buffer
+				} else {
+					s_omvSendIsToContinue = 0;
+				}
+			}
+			// <<<
         }
         break;
         case kUSB_DeviceCdcEventRecvResponse:
@@ -176,18 +262,63 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
             if ((1 == g_deviceComposite->cdcVcom.attach) && (1 == g_deviceComposite->cdcVcom.startTransactions))
             {
 				if (epCbParam->length != (uint32_t)-1L) {
-					if (mp_interrupt_char != -1 && epCbParam->length == 1 && s_rxRB.pBlks[s_rxRB.wNdx * s_rxRB.blkSize] == mp_interrupt_char)
-					{
-						pendsv_kbd_intr();
-					}
-					else 
-					{
+					if (debug_mode == 0) {
+						if (mp_interrupt_char != -1 && epCbParam->length == 1 && 
+							s_rxRB.pBlks[s_rxRB.wNdx * s_rxRB.blkSize] == mp_interrupt_char)
+						{
+							pendsv_kbd_intr();
+						}
+						else 
+						{
+							RingBlk_FixBlkFillCnt(&s_rxRB, epCbParam->length, &s_pCurRxBuf);
+							// check if there is keyboard IRQ
+							// provide USBD IP to receive next buffer
+							if (s_pCurRxBuf)
+								error = USB_DeviceCdcAcmRecv(handle, g_cfgFix.roCdcDicEpOutNdx, s_pCurRxBuf, VCP_RINGBLK_SIZE);
+							else {
+								usb_echo("VCOM receive buffer is overrun!\r\n");
+							}
+						}						
+					} else {
+						uint8_t Buf[VCP_RINGBLK_SIZE];
+						uint32_t bytes;
+					
+					#ifdef HSRX
+						bytes = epCbParam->length;
+						memcpy(Buf, s_hsRx, bytes);
+						
+					#else
+						// vcom conected to openMV IDE
 						RingBlk_FixBlkFillCnt(&s_rxRB, epCbParam->length, &s_pCurRxBuf);
 						// check if there is keyboard IRQ
 						// provide USBD IP to receive next buffer
+						bytes = RingBlk_Read1Blk(&s_rxRB, Buf, sizeof(Buf));
+					#endif
+					
+						if (0 == bytes)
+							printf("no data read!\r\n");
+				        if (dbg_xfer_length) {
+				            usbdbg_data_out(Buf, bytes);
+				            dbg_xfer_length -= bytes;
+				        } else if (Buf[0] == '\x30') { // command
+				            uint8_t request = Buf[1];
+				            dbg_xfer_length = *((uint32_t*)(Buf+2));
+				            usbdbg_control(Buf+6, request, dbg_xfer_length);
+				            if (dbg_xfer_length && (request & 0x80)) { //request has a device-to-host data phase
+				                send_packet(); //prime tx buffer
+				                if (dbg_xfer_length)
+									s_omvSendIsToContinue = 1;
+				            }
+				        }
+						
+					#ifdef HSRX
+						error = USB_DeviceCdcAcmRecv(handle, g_cfgFix.roCdcDicEpOutNdx, s_hsRx, VCP_RINGBLK_SIZE);	
+					#else 
 						if (s_pCurRxBuf)
-							error = USB_DeviceCdcAcmRecv(handle, g_cfgFix.roCdcDicEpOutNdx, s_pCurRxBuf, DATA_BUFF_SIZE);
+							error = USB_DeviceCdcAcmRecv(handle, g_cfgFix.roCdcDicEpOutNdx, s_pCurRxBuf, VCP_RINGBLK_SIZE);		
+					#endif	
 					}
+
 				}
             }
         }
@@ -257,13 +388,16 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
         case kUSB_DeviceCdcEventGetLineCoding:
             *(acmReqParam->buffer) = s_lineCoding;
             *(acmReqParam->length) = LINE_CODING_SIZE;
+			CheckOpenMVIDEConnect();	
             error = kStatus_USB_Success;
             break;
         case kUSB_DeviceCdcEventSetLineCoding:
-        {
+        {   
+
             if (1 == acmReqParam->isSetup)
             {
                 *(acmReqParam->buffer) = s_lineCoding;
+				CheckOpenMVIDEConnect();			
             }
             else
             {
@@ -289,10 +423,12 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
             if (acmInfo->dteStatus & USB_DEVICE_CDC_CONTROL_SIG_BITMAP_DTE_PRESENCE)
             {
                 acmInfo->uartState |= USB_DEVICE_CDC_UART_STATE_RX_CARRIER;
+				g_isUsbHostOpen = 1;
             }
             else
             {
                 acmInfo->uartState &= (uint16_t)~USB_DEVICE_CDC_UART_STATE_RX_CARRIER;
+				g_isUsbHostOpen = 0;
             }
 
             /* Indicates to DCE if DTE is present or not */
@@ -324,13 +460,16 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
             }
 
             /* Update status */
+			volatile uint32_t abc;
             if (acmInfo->dteStatus & USB_DEVICE_CDC_CONTROL_SIG_BITMAP_CARRIER_ACTIVATION)
             {
                 /*  To do: CARRIER_ACTIVATED */
+				usbdbg_disconnect();
             }
             else
             {
                 /* To do: CARRIER_DEACTIVATED */
+				abc = 0;
             }
 
 			g_deviceComposite->cdcVcom.startTransactions = g_deviceComposite->cdcVcom.attach;
@@ -380,11 +519,15 @@ usb_status_t USB_DeviceCdcVcomSetConfigure(class_handle_t handle, uint8_t config
     if (USB_COMPOSITE_CONFIGURE_INDEX == configure)
     {
         g_deviceComposite->cdcVcom.attach = 1;	
+		#ifdef HSRX
+		USB_DeviceCdcAcmRecv(g_deviceComposite->cdcVcom.cdcAcmHandle, g_cfgFix.roCdcDicEpOutNdx, s_hsRx, 64);
+		#else
 		/* Schedule buffer to receive */
 		s_pCurRxBuf = RingBlk_GetTakenBlk(&s_rxRB);
 		if (0 == s_pCurRxBuf)
 			s_pCurRxBuf = RingBlk_TakeNextFreeBlk(&s_rxRB);
-		USB_DeviceCdcAcmRecv(g_deviceComposite->cdcVcom.cdcAcmHandle, g_cfgFix.roCdcDicEpOutNdx, s_pCurRxBuf, DATA_BUFF_SIZE);
+		USB_DeviceCdcAcmRecv(g_deviceComposite->cdcVcom.cdcAcmHandle, g_cfgFix.roCdcDicEpOutNdx, s_pCurRxBuf, VCP_RINGBLK_SIZE);
+		#endif
 		/* Schedule buffer to send */
 //		if (s_isTxIdle) {
 //		uint32_t cbFill;
@@ -410,12 +553,13 @@ usb_status_t USB_DeviceCdcVcomSetConfigure(class_handle_t handle, uint8_t config
 usb_status_t USB_DeviceCdcVcomInit(usb_device_composite_struct_t *deviceComposite)
 {
     g_deviceComposite = deviceComposite;
-	RingBlk_Init(&s_txRB, s_SendBuf[0], DATA_BUFF_SIZE, VCP_OUTEPBUF_CNT);
-	RingBlk_Init(&s_rxRB, s_RecvBuf[0], DATA_BUFF_SIZE, VCP_INEPBUF_CNT);
+	RingBlk_Init(&s_txRB, s_SendBuf[0], VCP_RINGBLK_SIZE, VCP_OUTEPBUF_CNT);
+	RingBlk_Init(&s_rxRB, s_RecvBuf[0], VCP_RINGBLK_SIZE, VCP_INEPBUF_CNT);
+
 	s_isTxIdle = 1;
     return kStatus_USB_Success;
 }
-
+extern uint8_t g_isVcpOpen;
 uint32_t VCOM_RxBufGetFilledBytes(void) {
 	return RingBlk_GetUsedBytes(&s_rxRB);
 }
@@ -425,10 +569,21 @@ int USBD_CDC_TxHalfEmpty(void)
 	return (RingBlk_GetFreeBlks(&s_txRB) >= RingBlk_GetUsedBlks(&s_txRB));
 }
 
+
+void VCOM_Open(void) {
+	g_isVcpOpen = 1;
+}
+
+void VCOM_Close(void) {
+	g_isVcpOpen = 0;
+}
+
 int VCOM_Read(uint8_t *buf, uint32_t len, uint32_t timeout) 
 {
     // loop to read bytes
     int cbRead = 0;
+	if (!g_isVcpOpen)
+		return 0;
     while (cbRead < len) 
 	{
         // Wait until we have at least 1 byte to read
@@ -455,6 +610,8 @@ int VCOM_Read(uint8_t *buf, uint32_t len, uint32_t timeout)
 void VCOM_WriteAlways(const uint8_t *buf, uint32_t len) {
 	int i;
 	int retry = 0;
+	if (!g_isUsbHostOpen)
+		return;
     for (i = 0; i < len; ) {
 		while (RingBlk_GetFreeBytes(&s_txRB) == 0) {
 			__WFI();
@@ -463,7 +620,7 @@ void VCOM_WriteAlways(const uint8_t *buf, uint32_t len) {
 				goto cleanup;
 			}
 		}
-		i += RingBlk_Write(&s_txRB, buf, len - i);
+		i += RingBlk_Write(&s_txRB, buf + i, len - i);
     }
 cleanup:
 	if (s_isTxIdle && g_deviceComposite->cdcVcom.attach) {
@@ -472,8 +629,8 @@ cleanup:
 }
 
 int VCOM_Write(const uint8_t *buf, uint32_t len) {
-	int ret = len;
-	if (len == 0)
+	int ret = 0;
+	if (!g_isUsbHostOpen || len == 0)
 		goto cleanup;
 	ret = RingBlk_Write(&s_txRB, buf, len);
 	if (ret && s_isTxIdle && g_deviceComposite->cdcVcom.attach) {
@@ -483,5 +640,47 @@ cleanup:
 	return ret;
 }
 
+bool VCOM_IsTxIdle(void) {
+	return s_isTxIdle ? 1 : 0;
+}
 
+bool VCOM_OmvIsIdeConnected(void)
+{
+	if (debug_mode)
+		return 1;
+	return 0;
+}
+
+void VCOM_OmvWriteAlways(const uint8_t *buf, uint32_t len) {
+	int i;
+	int retry = 0;
+    for (i = 0; i < len; ) {
+		while (RingBlk_GetFreeBytes(&s_omvRB) == 0) {
+			__WFI();
+			if (retry++ >= 100) {
+				goto cleanup;
+			}
+		}
+		i += RingBlk_Write(&s_omvRB, buf + i, len - i);
+    }
+cleanup:
+	return;
+}
+
+
+uint32_t VCOM_OmvGetLogTxLen(void)
+{
+	return RingBlk_GetUsedBytes(&s_omvRB);
+}
+int VCOM_OmvReadLogTxBlk(uint8_t *pBuf, uint32_t bufSize) {
+	int ret;
+	ring_block_t rbBkup = s_omvRB;
+tryread:
+	ret = RingBlk_Read(&s_omvRB, pBuf, bufSize);
+	if (ret < bufSize && rbBkup.cbTotUsed > ret) {
+		s_omvRB = rbBkup;
+		goto tryread;
+	}
+	return ret;
+}
 
