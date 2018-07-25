@@ -112,7 +112,7 @@ volatile static usb_device_composite_struct_t *g_deviceComposite;
 #define ALIGN32 __ALIGNED(32)
 
 ring_block_t s_omvRB;
-USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_omvTxBuf[8][VCP_RINGBLK_SIZE];
+USB_ALIGN static uint8_t s_omvTxBuf[8][VCP_RINGBLK_SIZE];
 
 #define IDE_BAUDRATE_SLOW    (921600)
 #define IDE_BAUDRATE_FAST    (12000000)
@@ -128,6 +128,8 @@ usb_status_t _Start_USB_VCOM_Write(class_handle_t handle)
 	usb_status_t error = kStatus_USB_Error;
 	uint32_t len;
 	uint8_t txIdleBkup;
+	uint32_t primask = __get_PRIMASK();
+	__set_PRIMASK(1);	// must disable IRQ, otherwise a buffer can be sent 2 times
 	/* User: add your own code for send complete event */
 	len = RingBlk_GetOldestBlk(&s_txRB, &s_pCurTxBuf); 
 	if (len > 0) {
@@ -140,6 +142,7 @@ usb_status_t _Start_USB_VCOM_Write(class_handle_t handle)
 		} else
 			RingBlk_FreeOldestBlk(&s_txRB, 0);	// no longer allow to continue to append data on this block
 	}
+	__set_PRIMASK(primask);
 	return error;
 }
 
@@ -174,7 +177,7 @@ uint8_t *usbd_cdc_tx_buf(uint32_t bytes)
 }
 
 
-void CheckOpenMVIDEConnect(void) {
+void CheckVCOMConnect(void) {
 	baudrate = *((uint32_t*)s_lineCoding);
 	// The slow baudrate can be used on OSs that don't support custom baudrates
 	if (baudrate == IDE_BAUDRATE_SLOW || baudrate == IDE_BAUDRATE_FAST) {
@@ -266,25 +269,24 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
         case kUSB_DeviceCdcEventRecvResponse:
         {
             if ((1 == g_deviceComposite->cdcVcom.attach) && (1 == g_deviceComposite->cdcVcom.startTransactions))
-            {
+            {	g_isUsbHostOpen = 1;
 				if (epCbParam->length != (uint32_t)-1L) {
-					if (debug_mode == 0) {
+					if (debug_mode == 0) 
+					{
 						if (mp_interrupt_char != -1 && epCbParam->length == 1 && 
-							s_rxRB.pBlks[s_rxRB.wNdx * s_rxRB.blkSize] == mp_interrupt_char)
+						s_rxRB.pBlks[s_rxRB.wNdx * s_rxRB.blkSize] == mp_interrupt_char)
 						{
 							pendsv_kbd_intr();
-						}
-						else 
-						{
+							RingBlk_ReuseTakenBlk(&s_rxRB, &s_pCurRxBuf);
+						} else {
 							RingBlk_FixBlkFillCnt(&s_rxRB, epCbParam->length, &s_pCurRxBuf);
-							// check if there is keyboard IRQ
-							// provide USBD IP to receive next buffer
-							if (s_pCurRxBuf)
-								error = USB_DeviceCdcAcmRecv(handle, g_cfgFix.roCdcDicEpOutNdx, s_pCurRxBuf, VCP_RINGBLK_SIZE);
-							else {
-								usb_echo("VCOM receive buffer is overrun!\r\n");
-							}
-						}						
+						}
+						// provide USBD IP to receive next buffer
+						if (s_pCurRxBuf)
+							error = USB_DeviceCdcAcmRecv(handle, g_cfgFix.roCdcDicEpOutNdx, s_pCurRxBuf, VCP_RINGBLK_SIZE);
+						else {
+							usb_echo("VCOM receive buffer is overrun!\r\n");
+						}
 					} else {
 						uint8_t Buf[VCP_RINGBLK_SIZE];
 						uint32_t bytes;
@@ -392,18 +394,19 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
         case kUSB_DeviceCdcEventClearCommFeature:
             break;
         case kUSB_DeviceCdcEventGetLineCoding:
+			g_isUsbHostOpen = 1;
             *(acmReqParam->buffer) = s_lineCoding;
             *(acmReqParam->length) = LINE_CODING_SIZE;
-			CheckOpenMVIDEConnect();	
+			CheckVCOMConnect();	
             error = kStatus_USB_Success;
             break;
         case kUSB_DeviceCdcEventSetLineCoding:
         {   
-
+			g_isUsbHostOpen = 1;
             if (1 == acmReqParam->isSetup)
             {
                 *(acmReqParam->buffer) = s_lineCoding;
-				CheckOpenMVIDEConnect();			
+				CheckVCOMConnect();			
             }
             else
             {
@@ -414,6 +417,7 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
             break;
         case kUSB_DeviceCdcEventSetControlLineState:
         {
+			g_isUsbHostOpen = 0;
             s_usbCdcAcmInfo.dteStatus = acmReqParam->setupValue;
             /* activate/deactivate Tx carrier */
             if (acmInfo->dteStatus & USB_DEVICE_CDC_CONTROL_SIG_BITMAP_CARRIER_ACTIVATION)
@@ -615,7 +619,14 @@ int VCOM_Read(uint8_t *buf, uint32_t len, uint32_t timeout)
 	return cbRead;
 }
 
+volatile uint8_t s_isByPassWriteAlways;
 void VCOM_WriteAlways(const uint8_t *buf, uint32_t len) {
+	if (s_isByPassWriteAlways) {
+		VCOM_Write(buf, len);
+		return;
+	}
+	if (0 == len)
+		goto cleanup;	
 	int i;
 	int retry = 0;
 	if (!g_isUsbHostOpen)
@@ -630,10 +641,11 @@ void VCOM_WriteAlways(const uint8_t *buf, uint32_t len) {
 		}
 		i += RingBlk_Write(&s_txRB, buf + i, len - i);
     }
-cleanup:
 	if (s_isTxIdle && g_deviceComposite->cdcVcom.attach) {
 		_Start_USB_VCOM_Write(g_deviceComposite->cdcVcom.cdcAcmHandle);
 	}
+cleanup:
+	return;
 }
 
 int VCOM_Write(const uint8_t *buf, uint32_t len) {
